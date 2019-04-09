@@ -6,6 +6,7 @@ const {connectStateHistorySocket} = require("../connections/state-history");
 const {amqpConnect} = require("../connections/rabbitmq");
 const pmx = require('pmx');
 
+const { TextEncoder, TextDecoder } = require('text-encoding');
 const txDec = new TextDecoder();
 const txEnc = new TextEncoder();
 

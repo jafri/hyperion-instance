@@ -4,9 +4,6 @@ const cluster = require('cluster');
 const fs = require('fs');
 const redis = require('redis');
 const pmx = require('pmx');
-const doctor = require('./doctor');
-
-const {elasticsearchConnect} = require("./connections/elasticsearch");
 
 const {
     getLastIndexedBlock,
@@ -31,11 +28,8 @@ async function main() {
 
     const rClient = redis.createClient();
     const getAsync = promisify(rClient.get).bind(rClient);
-    client = await elasticsearchConnect();
 
     const n_deserializers = parseInt(process.env.DESERIALIZERS, 10);
-    const n_ingestors_per_queue = parseInt(process.env.ES_INDEXERS_PER_QUEUE, 10);
-    const action_indexing_ratio = parseInt(process.env.ES_ACT_QUEUES, 10);
 
     let max_readers = parseInt(process.env.READERS, 10);
     if (process.env.DISABLE_READING === 'true') {
@@ -55,45 +49,6 @@ async function main() {
 
     const index_queue_prefix = queue_prefix + ':index';
 
-    const script_status = await client.putScript({
-        id: "updateByBlock",
-        body: {
-            script: {
-                lang: "painless",
-                source: `
-                
-                    boolean valid = false;
-                    
-                    if(ctx._source.block_num != null) {
-                      if(params.block_num < ctx._source.block_num) {
-                        ctx['op'] = 'none';
-                        valid = false;
-                      } else {
-                        valid = true;
-                      } 
-                    } else {
-                      valid = true;
-                    }
-                    
-                    if(valid == true) {
-                      for (entry in params.entrySet()) {
-                        if(entry.getValue() != null) {
-                          ctx._source[entry.getKey()] = entry.getValue();
-                        } else {
-                          ctx._source.remove(entry.getKey());
-                        }
-                      }
-                    }
-                `
-            }
-        }
-    });
-
-    if (!script_status['acknowledged']) {
-        console.log('Failed to load script updateByBlock. Aborting!');
-        process.exit(1);
-    }
-
     // Optional state tables
     if (process.env.ACCOUNT_STATE === 'true') {
         indicesList.push("table-accounts");
@@ -112,63 +67,6 @@ async function main() {
     if (process.env.USERRES_STATE === 'true') {
         indicesList.push("table-userres");
         index_queues.push({type: 'table-userres', name: index_queue_prefix + "_table_userres"});
-    }
-
-    const indexConfig = require('./definitions/mappings');
-
-    // Update index templates
-    for (const index of indicesList) {
-        const creation_status = await client['indices'].putTemplate({
-            name: `${queue_prefix}-${index}`,
-            body: indexConfig[index]
-        });
-        if (!creation_status['acknowledged']) {
-            console.log('Failed to create template', `${queue_prefix}-${index}`);
-            console.log(creation_status);
-            process.exit(1);
-        }
-    }
-
-    console.log('Index templates updated');
-
-    if (process.env.CREATE_INDICES !== 'false' && process.env.CREATE_INDICES) {
-        // Create indices
-        let version = '';
-        if (process.env.CREATE_INDICES === 'true') {
-            version = 'v1';
-        } else {
-            version = process.env.CREATE_INDICES;
-        }
-        for (const index of indicesList) {
-            const new_index = `${queue_prefix}-${index}-${version}-000001`;
-            const exists = await client['indices'].exists({
-                index: new_index
-            });
-            if (!exists) {
-                console.log(`Creating index ${new_index}...`);
-                await client['indices'].create({
-                    index: new_index
-                });
-                console.log(`Creating alias ${queue_prefix}-${index} >> ${new_index}`);
-                await client['indices'].putAlias({
-                    index: new_index,
-                    name: `${queue_prefix}-${index}`
-                });
-            } else {
-                console.log(`WARNING! Index ${new_index} already created!`);
-            }
-        }
-    }
-
-    // Check for indexes
-    for (const index of indicesList) {
-        const status = await client['indices'].existsAlias({
-            name: `${queue_prefix}-${index}`
-        });
-        if (!status) {
-            console.log('Alias ' + `${queue_prefix}-${index}` + ' not found! Aborting!');
-            process.exit(1);
-        }
     }
 
     const workerMap = [];
@@ -224,14 +122,6 @@ async function main() {
 
     }, log_interval);
 
-    let lastIndexedBlock;
-    if (process.env.INDEX_DELTAS === 'true') {
-        lastIndexedBlock = await getLastIndexedBlockByDelta(client);
-        console.log('Last indexed block (deltas):', lastIndexedBlock);
-    } else {
-        lastIndexedBlock = await getLastIndexedBlock(client);
-        console.log('Last indexed block (blocks):', lastIndexedBlock);
-    }
 
     // Start from the last indexed block
     let starting_block = 1;
@@ -240,27 +130,16 @@ async function main() {
     const chain_data = await rpc.get_info();
     let head = chain_data['head_block_num'];
 
-    if (lastIndexedBlock > 0) {
-        starting_block = lastIndexedBlock;
-    }
-
     if (process.env.STOP_ON !== "0") {
         head = parseInt(process.env.STOP_ON, 10);
     }
-
-    let lastIndexedABI = await getLastIndexedABI(client);
-    console.log(`Last indexed ABI: ${lastIndexedABI}`);
 
     if (process.env.START_ON !== "0") {
         starting_block = parseInt(process.env.START_ON, 10);
         // Check last indexed block again
         if (process.env.REWRITE !== 'true') {
             let lastIndexedBlockOnRange;
-            if (process.env.INDEX_DELTAS === 'true') {
-                lastIndexedBlockOnRange = await getLastIndexedBlockByDeltaFromRange(client, starting_block, head);
-            } else {
-                lastIndexedBlockOnRange = await getLastIndexedBlockFromRange(client, starting_block, head);
-            }
+
             if (lastIndexedBlockOnRange > starting_block) {
                 console.log('WARNING! Data present on target range!');
                 console.log('Changing initial block num. Use REWRITE = true to bypass.');
@@ -324,31 +203,6 @@ async function main() {
             });
         }
     }
-
-    // Setup ES Ingestion Workers
-    index_queues.forEach((q) => {
-        let n = n_ingestors_per_queue;
-        if (q.type === 'abi') {
-            n = 1;
-        }
-        let qIdx = 0;
-        for (let i = 0; i < n; i++) {
-            let m = 1;
-            if (q.type === 'action') {
-                m = action_indexing_ratio;
-            }
-            for (let j = 0; j < m; j++) {
-                worker_index++;
-                workerMap.push({
-                    worker_id: worker_index,
-                    worker_role: 'ingestor',
-                    type: q.type,
-                    queue: q.name + ":" + (qIdx + 1)
-                });
-                qIdx++;
-            }
-        }
-    });
 
     // Setup ws router
     if (process.env.ENABLE_STREAMING) {
@@ -496,47 +350,6 @@ async function main() {
                 workerHandler(msg, self);
             });
         }
-    }
-
-    let doctorStarted = false;
-    let doctorIdle = true;
-    let doctorId = 0;
-    if (process.env.REPAIR_MODE === 'true') {
-        doctor.run(missingRanges).then(() => {
-            console.log('repair completed!');
-        });
-        setInterval(() => {
-            if (missingRanges.length > 0 && !doctorStarted) {
-                doctorStarted = true;
-                console.log('repair worker launched');
-                const range_data = missingRanges.shift();
-                worker_index++;
-                const def = {
-                    worker_id: worker_index,
-                    worker_role: 'reader',
-                    first_block: range_data.start,
-                    last_block: range_data.end
-                };
-                const self = cluster.fork(def);
-                doctorId = def.worker_id;
-                console.log('repair id =', doctorId);
-                self.on('message', (msg) => {
-                    workerHandler(msg, self);
-                });
-            } else {
-                if (missingRanges.length > 0 && doctorIdle) {
-                    const range_data = missingRanges.shift();
-                    messageAllWorkers(cluster, {
-                        event: 'new_range',
-                        target: doctorId.toString(),
-                        data: {
-                            first_block: range_data.start,
-                            last_block: range_data.end
-                        }
-                    });
-                }
-            }
-        }, 1000);
     }
 
     pmx.action('stop', (reply) => {

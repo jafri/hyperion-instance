@@ -9,17 +9,17 @@ const {deserialize, unzipAsync} = require('../helpers/functions');
 const async = require('async');
 const {amqpConnect} = require("../connections/rabbitmq");
 const {connectRpc} = require("../connections/chain");
-const {elasticsearchConnect} = require("../connections/elasticsearch");
 
 const redis = require('redis');
 const {promisify} = require('util');
 const rClient = redis.createClient();
 const getAsync = promisify(rClient.get).bind(rClient);
 
+const { TextEncoder, TextDecoder } = require('text-encoding');
 const txDec = new TextDecoder();
 const txEnc = new TextEncoder();
 
-let ch, api, types, client, cch, rpc, abi;
+let ch, api, types, cch, rpc, abi;
 let tables = new Map();
 let chainID = null;
 let act_emit_idx = 1;
@@ -850,8 +850,6 @@ async function run() {
         textDecoder: txDec,
         textEncoder: txEnc,
     });
-
-    client = elasticsearchConnect();
 
     // Connect to RabbitMQ (amqplib)
     [ch, cch] = await amqpConnect();

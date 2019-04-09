@@ -9,11 +9,11 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@elastic/elasticsearch": "^7.0.0-rc.1",
     "amqplib": "^0.5.3",
     "async": "^2.6.2",
     "async-redis": "^1.1.7",
     "async-timed-cargo": "^0.0.3",
-    "@elastic/elasticsearch": "^7.0.0-rc.1",
     "elasticsearch-scroll-stream": "^1.1.4",
     "eosjs": "20.0.0",
     "eosjs-ecc": "^4.0.4",
